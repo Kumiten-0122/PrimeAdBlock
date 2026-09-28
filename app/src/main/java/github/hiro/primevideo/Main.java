@@ -10,76 +10,164 @@ import de.robv.android.xposed.XposedHelpers;
 import de.robv.android.xposed.callbacks.XC_LoadPackage;
 
 public class Main implements IXposedHookLoadPackage {
-    private static final String TAG = "PrimeVideoAdSkip";
-    private static final String AD_CLIP_STATE = "com.amazon.avod.media.ads.internal.state.AdClipState";
-    private static final String TRIGGER = "com.amazon.avod.fsm.Trigger";
 
-    private final Handler mainHandler = new Handler(Looper.getMainLooper());
+    private static final String TAG = "PrimeVideoAdSkip";
+
+    private static final String PRIME_VIDEO_PACKAGE =
+            "com.amazon.avod.thirdpartyclient";
+
+    private static final String AD_CLIP_STATE =
+            "com.amazon.avod.media.ads.internal.state.AdClipState";
+
+    private static final String TRIGGER =
+            "com.amazon.avod.fsm.Trigger";
 
     @Override
-    public void handleLoadPackage(final XC_LoadPackage.LoadPackageParam lpparam) throws Throwable {
+    public void handleLoadPackage(final XC_LoadPackage.LoadPackageParam lpparam)
+            throws Throwable {
+
+        if (!PRIME_VIDEO_PACKAGE.equals(lpparam.packageName)) {
+            return;
+        }
+
+        XposedBridge.log(TAG + ": Prime Video loaded");
         hookAdClipState(lpparam.classLoader);
     }
 
     private void hookAdClipState(final ClassLoader classLoader) {
         try {
-            final Class<?> adClipStateClass = XposedHelpers.findClassIfExists(AD_CLIP_STATE, classLoader);
-            final Class<?> triggerClass = XposedHelpers.findClassIfExists(TRIGGER, classLoader);
+            final Class<?> adClipStateClass =
+                    XposedHelpers.findClass(AD_CLIP_STATE, classLoader);
 
-            if (adClipStateClass == null || triggerClass == null) return;
+            final Class<?> triggerClass =
+                    XposedHelpers.findClass(TRIGGER, classLoader);
 
-            XposedHelpers.findAndHookMethod(adClipStateClass, "enter", triggerClass, new XC_MethodHook() {
-                @Override
-                protected void afterHookedMethod(final MethodHookParam param) {
-                    try {
-                        final Object trigger = param.args[0];
-                        if (trigger == null) return;
-
-                        final Object triggerType = XposedHelpers.callMethod(trigger, "getType");
-                        if (triggerType == null || !"NEXT_AD_CLIP_SERVER_INSERTED".equals(triggerType.toString())) return;
-
-                        final Object context = XposedHelpers.callMethod(param.thisObject, "getContext");
-                        if (context == null) return;
-
-                        final Object currentAdClip = XposedHelpers.callMethod(context, "getCurrentAdClip");
-                        if (currentAdClip == null) return;
-
-                        final Object stateMachine = XposedHelpers.callMethod(context, "getStateMachine");
-                        if (stateMachine == null) return;
-
-                        XposedBridge.log(TAG + ": Ad clip detected: " + getAdId(currentAdClip));
-
-                        mainHandler.post(() -> {
+            XposedHelpers.findAndHookMethod(
+                    adClipStateClass,
+                    "enter",
+                    triggerClass,
+                    new XC_MethodHook() {
+                        @Override
+                        protected void afterHookedMethod(
+                                final MethodHookParam param)
+                                throws Throwable {
                             try {
-                                Object latestAdClip = XposedHelpers.callMethod(context, "getCurrentAdClip");
-                                if (latestAdClip != currentAdClip) {
-                                    XposedBridge.log(TAG + ": Ad clip changed before skip");
+                                final Object trigger = param.args[0];
+                                if (trigger == null) return;
+
+                                final Object triggerType =
+                                        XposedHelpers.callMethod(
+                                                trigger, "getType");
+
+                                if (triggerType == null) return;
+
+                                if (!"NEXT_AD_CLIP_SERVER_INSERTED"
+                                        .equals(triggerType.toString())) {
                                     return;
                                 }
 
-                                XposedHelpers.callMethod(stateMachine, "skipCurrentAdClip");
-                                XposedBridge.log(TAG + ": skipCurrentAdClip(): " + getAdId(currentAdClip));
-                            } catch (Throwable t) {
-                                XposedBridge.log(TAG + ": skipCurrentAdClip failed: " + android.util.Log.getStackTraceString(t));
-                            }
-                        });
-                    } catch (Throwable t) {
-                        XposedBridge.log(TAG + ": enter hook failed: " + android.util.Log.getStackTraceString(t));
-                    }
-                }
-            });
+                                final Object adClipState =
+                                        param.thisObject;
 
-            XposedBridge.log(TAG + ": AdClipState.enter hooked");
+                                final Object context =
+                                        XposedHelpers.callMethod(
+                                                adClipState, "getContext");
+
+                                if (context == null) {
+                                    log("getContext() == null");
+                                    return;
+                                }
+
+                                final Object currentAdClip =
+                                        XposedHelpers.callMethod(
+                                                context, "getCurrentAdClip");
+
+                                if (currentAdClip == null) {
+                                    log("currentAdClip == null");
+                                    return;
+                                }
+
+                                final Object stateMachine =
+                                        XposedHelpers.callMethod(
+                                                context, "getStateMachine");
+
+                                if (stateMachine == null) {
+                                    log("stateMachine == null");
+                                    return;
+                                }
+
+                                log("Ad clip detected: "
+                                        + getAdId(currentAdClip));
+
+                                new Handler(Looper.getMainLooper()).post(new Runnable() {
+                                    @Override
+                                    public void run() {
+                                        try {
+                                            Object latestAdClip =
+                                                    XposedHelpers.callMethod(
+                                                            context,
+                                                            "getCurrentAdClip");
+
+                                            if (latestAdClip != currentAdClip) {
+                                                log("Ad clip changed before skip");
+                                                return;
+                                            }
+
+                                            XposedHelpers.callMethod(
+                                                    stateMachine,
+                                                    "skipCurrentAdClip");
+
+                                            log("skipCurrentAdClip() called: "
+                                                    + getAdId(currentAdClip));
+
+                                        } catch (Throwable t) {
+                                            logError(
+                                                    "skipCurrentAdClip() failed",
+                                                    t);
+                                        }
+                                    }
+                                });
+
+                            } catch (Throwable t) {
+                                logError(
+                                        "AdClipState.enter hook failed",
+                                        t);
+                            }
+                        }
+                    }
+            );
+
+            log("AdClipState.enter hooked");
+
         } catch (Throwable t) {
-            XposedBridge.log(TAG + ": hook initialization failed: " + android.util.Log.getStackTraceString(t));
+            logError(
+                    "Failed to hook AdClipState.enter",
+                    t);
         }
     }
 
-    private String getAdId(Object adClip) {
+    private String getAdId(final Object adClip) {
+        if (adClip == null) return "null";
         try {
-            return String.valueOf(XposedHelpers.callMethod(adClip, "getAdId"));
+            Object adId = XposedHelpers.callMethod(
+                    adClip, "getAdId");
+            return String.valueOf(adId);
         } catch (Throwable ignored) {
             return "?";
         }
+    }
+
+    private static void log(final String message) {
+        XposedBridge.log(TAG + ": " + message);
+    }
+
+    private static void logError(
+            final String message,
+            final Throwable throwable) {
+        XposedBridge.log(
+                TAG + ": " + message
+                        + "\n"
+                        + android.util.Log.getStackTraceString(
+                        throwable));
     }
 }
