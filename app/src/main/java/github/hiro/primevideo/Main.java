@@ -1,4 +1,4 @@
-package github.adskip.primevideo;
+package nagi.adskip.primevideo;
 
 import android.os.Handler;
 import android.os.Looper;
