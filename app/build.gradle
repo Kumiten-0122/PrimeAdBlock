@@ -3,10 +3,11 @@ plugins {
 }
 
 android {
-    namespace 'io.hiro.primevideo'
+    namespace 'nagi.adskip.primevideo'
     compileSdk 35
 
     defaultConfig {
+        applicationId 'nagi.adskip.primevideo'
         minSdk 26
         targetSdk 34
         versionCode 1
