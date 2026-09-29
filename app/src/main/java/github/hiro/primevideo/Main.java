@@ -31,7 +31,7 @@ public class Main implements IXposedHookLoadPackage {
             final Class<?> adClipStateClass = XposedHelpers.findClass(AD_CLIP_STATE, classLoader);
             final Class<?> triggerClass = XposedHelpers.findClass(TRIGGER, classLoader);
 
-            Thread.sleep(460)
+            Thread.sleep(460);
 
             XposedHelpers.findAndHookMethod(
                     adClipStateClass,
