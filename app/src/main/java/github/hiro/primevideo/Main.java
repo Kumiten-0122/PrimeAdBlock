@@ -17,7 +17,7 @@ public class Main implements IXposedHookLoadPackage {
     private static final String AD_CLIP_STATE = "com.amazon.avod.media.ads.internal.state.AdClipState";
     private static final String TRIGGER = "com.amazon.avod.fsm.Trigger";
 
-    private static final int MAX_SKIP_ATTEMPTS = 5;
+    private static final int MAX_SKIP_ATTEMPTS = 10;
     private static final long SKIP_RETRY_DELAY_MS = 46;
 
     private final ScheduledExecutorService executor =
