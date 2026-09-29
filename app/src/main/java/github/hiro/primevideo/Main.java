@@ -98,7 +98,7 @@ public class Main implements IXposedHookLoadPackage {
                                             logError("skipCurrentAdClip() failed", t);
                                         }
                                     }
-                                }, ０);
+                                }, 0);
 
                             } catch (Throwable t) {
                                 logError("AdClipState.enter hook failed", t);
