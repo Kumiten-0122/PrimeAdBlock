@@ -31,6 +31,8 @@ public class Main implements IXposedHookLoadPackage {
             final Class<?> adClipStateClass = XposedHelpers.findClass(AD_CLIP_STATE, classLoader);
             final Class<?> triggerClass = XposedHelpers.findClass(TRIGGER, classLoader);
 
+            Thread.sleep(460)
+
             XposedHelpers.findAndHookMethod(
                     adClipStateClass,
                     "enter",
@@ -96,7 +98,7 @@ public class Main implements IXposedHookLoadPackage {
                                             logError("skipCurrentAdClip() failed", t);
                                         }
                                     }
-                                }, 460);
+                                }, ０);
 
                             } catch (Throwable t) {
                                 logError("AdClipState.enter hook failed", t);
