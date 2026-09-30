@@ -18,7 +18,7 @@ public class Main implements IXposedHookLoadPackage {
     private static final String TRIGGER = "com.amazon.avod.fsm.Trigger";
 
     private static final int MAX_SKIP_ATTEMPTS = 10;
-    private static final long SKIP_RETRY_DELAY_MS = 100;
+    private static final long SKIP_RETRY_DELAY_MS = 460;
 
     private final ScheduledExecutorService executor =
             Executors.newSingleThreadScheduledExecutor();
