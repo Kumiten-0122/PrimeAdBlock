@@ -17,18 +17,14 @@ public class Main implements IXposedHookLoadPackage {
     private static final String AD_CLIP_STATE = "com.amazon.avod.media.ads.internal.state.AdClipState";
     private static final String TRIGGER = "com.amazon.avod.fsm.Trigger";
 
-    private static final int MAX_SKIP_ATTEMPTS = 10;
-    private static final long INITIAL_SKIP_DELAY_MS = 460;
-    private static final long SKIP_RETRY_DELAY_MS = 100;
+    private static final int MAX_SKIP_ATTEMPTS = 20;
+    private static final long SKIP_DELAY_MS = 100;
 
-    private final ScheduledExecutorService executor =
-            Executors.newSingleThreadScheduledExecutor();
+    private final ScheduledExecutorService executor = Executors.newSingleThreadScheduledExecutor();
 
     @Override
     public void handleLoadPackage(final XC_LoadPackage.LoadPackageParam lpparam) throws Throwable {
-        if (!PRIME_VIDEO_PACKAGE.equals(lpparam.packageName)) {
-            return;
-        }
+        if (!PRIME_VIDEO_PACKAGE.equals(lpparam.packageName)) return;
 
         XposedBridge.log(TAG + ": Prime Video loaded");
         hookAdClipState(lpparam.classLoader);
@@ -36,10 +32,8 @@ public class Main implements IXposedHookLoadPackage {
 
     private void hookAdClipState(final ClassLoader classLoader) {
         try {
-            final Class<?> adClipStateClass =
-                    XposedHelpers.findClass(AD_CLIP_STATE, classLoader);
-            final Class<?> triggerClass =
-                    XposedHelpers.findClass(TRIGGER, classLoader);
+            final Class<?> adClipStateClass = XposedHelpers.findClass(AD_CLIP_STATE, classLoader);
+            final Class<?> triggerClass = XposedHelpers.findClass(TRIGGER, classLoader);
 
             XposedHelpers.findAndHookMethod(
                     adClipStateClass,
@@ -54,36 +48,23 @@ public class Main implements IXposedHookLoadPackage {
 
                                 final Object triggerType = XposedHelpers.callMethod(trigger, "getType");
                                 if (triggerType == null) return;
-
-                                if (!"NEXT_AD_CLIP_SERVER_INSERTED".equals(triggerType.toString())) {
-                                    return;
-                                }
+                                if (!"NEXT_AD_CLIP_SERVER_INSERTED".equals(triggerType.toString())) return;
 
                                 final Object adClipState = param.thisObject;
                                 final Object context = XposedHelpers.callMethod(adClipState, "getContext");
-
                                 if (context == null) {
                                     log("getContext() == null");
                                     return;
                                 }
 
                                 final Object currentAdClip = XposedHelpers.callMethod(context, "getCurrentAdClip");
-
                                 if (currentAdClip == null) {
                                     log("currentAdClip == null");
                                     return;
                                 }
 
-                                final Object stateMachine = XposedHelpers.callMethod(context, "getStateMachine");
-
-                                if (stateMachine == null) {
-                                    log("stateMachine == null");
-                                    return;
-                                }
-
                                 log("Ad clip detected: " + getAdId(currentAdClip));
-
-                                scheduleSkip(context, stateMachine, currentAdClip, 1, INITIAL_SKIP_DELAY_MS);
+                                scheduleSkip(context, currentAdClip, 1);
 
                             } catch (Throwable t) {
                                 logError("AdClipState.enter hook failed", t);
@@ -99,8 +80,7 @@ public class Main implements IXposedHookLoadPackage {
         }
     }
 
-    private void scheduleSkip(final Object context, final Object stateMachine, final Object targetAdClip, final int attempt, final long delayMs) {
-
+    private void scheduleSkip(final Object context, final Object targetAdClip, final int attempt) {
         executor.schedule(new Runnable() {
             @Override
             public void run() {
@@ -117,51 +97,31 @@ public class Main implements IXposedHookLoadPackage {
                         return;
                     }
 
-                    log("skipCurrentAdClip() attempt "
-                            + attempt + "/" + MAX_SKIP_ATTEMPTS
-                            + ": " + getAdId(targetAdClip));
-
-                    XposedHelpers.callMethod(
-                            stateMachine,
-                            "skipCurrentAdClip");
-
-                    if (attempt >= MAX_SKIP_ATTEMPTS) {
-                        log("Ad skip retry limit reached: "
-                                + getAdId(targetAdClip));
+                    final Object stateMachine = XposedHelpers.callMethod(context, "getStateMachine");
+                    if (stateMachine == null) {
+                        log("stateMachine == null");
                         return;
                     }
 
-                    executor.schedule(new Runnable() {
-                        @Override
-                        public void run() {
-                            try {
-                                final Object latestAdClip = XposedHelpers.callMethod(
-                                                context,
-                                                "getCurrentAdClip");
+                    log("skipCurrentAdClip() attempt " + attempt + "/" + MAX_SKIP_ATTEMPTS + ": " + getAdId(targetAdClip));
+                    XposedHelpers.callMethod(stateMachine, "skipCurrentAdClip");
 
-                                if (latestAdClip == null) {
-                                    log("Ad skip completed: currentAdClip == null");
-                                    return;
-                                }
+                    if (attempt >= MAX_SKIP_ATTEMPTS) {
+                        log("Ad skip retry limit reached: " + getAdId(targetAdClip));
+                        return;
+                    }
 
-                                if (latestAdClip != targetAdClip) {
-                                    log("Ad skip completed: ad clip changed");
-                                    return;
-                                }
-
-                                scheduleSkip(context, stateMachine, targetAdClip, attempt + 1, SKIP_RETRY_DELAY_MS);
-
-                            } catch (Throwable t) {
-                                logError("Ad skip retry check failed", t);
-                            }
-                        }
-                    }, SKIP_RETRY_DELAY_MS, TimeUnit.MILLISECONDS);
+                    scheduleSkip(context, targetAdClip, attempt + 1);
 
                 } catch (Throwable t) {
-                    logError("skipCurrentAdClip() failed", t);
+                    logError("Ad skip attempt failed", t);
+
+                    if (attempt < MAX_SKIP_ATTEMPTS) {
+                        scheduleSkip(context, targetAdClip, attempt + 1);
+                    }
                 }
             }
-        }, delayMs, TimeUnit.MILLISECONDS);
+        }, SKIP_DELAY_MS, TimeUnit.MILLISECONDS);
     }
 
     private String getAdId(final Object adClip) {
