@@ -24,6 +24,8 @@ public class Main implements IXposedHookLoadPackage {
 
     private final ScheduledExecutorService executor = Executors.newSingleThreadScheduledExecutor();
 
+    private boolean playerFieldsLogged = false;
+
     @Override
     public void handleLoadPackage(final XC_LoadPackage.LoadPackageParam lpparam) throws Throwable {
         if (!PRIME_VIDEO_PACKAGE.equals(lpparam.packageName)) return;
@@ -157,7 +159,14 @@ public class Main implements IXposedHookLoadPackage {
                     }
 
                     final long logicalPosition = getLogicalPosition(primaryPlayer);
-                    final long rawPosition = getRawPlayerPosition(primaryPlayer);
+
+                    long rawPosition = -1;
+
+                    try {
+                        rawPosition = getRawPlayerPosition(primaryPlayer);
+                    } catch (Throwable t) {
+                        logError("Raw player position failed", t);
+                    }
 
                     final Object currentAdClip = XposedHelpers.callMethod(context, "getCurrentAdClip");
 
@@ -175,7 +184,10 @@ public class Main implements IXposedHookLoadPackage {
                             ", logical=" + logicalPosition +
                             ", raw=" + rawPosition
                         );
-                    } else if (elapsed >= VERIFY_TIMEOUT_MS) {
+                        return;
+                    }
+
+                    if (elapsed >= VERIFY_TIMEOUT_MS) {
                         log(
                             "Ad skip FAILED: " + getAdId(targetAdClip) +
                             ", logical=" + logicalPosition +
@@ -183,9 +195,10 @@ public class Main implements IXposedHookLoadPackage {
                             ", target=" + targetPosition +
                             ", currentAdClip=" + getAdId(currentAdClip)
                         );
-                    } else {
-                        verifySeek(context, targetAdClip, targetPosition, startTime);
+                        return;
                     }
+
+                    verifySeek(context, targetAdClip, targetPosition, startTime);
 
                 } catch (Throwable t) {
                     logError("Seek verification failed", t);
@@ -200,31 +213,93 @@ public class Main implements IXposedHookLoadPackage {
     }
 
     private long getRawPlayerPosition(final Object primaryPlayer) throws Throwable {
-        final Object rawPlayer = findFieldValue(primaryPlayer, "mPlayer");
+        if (!playerFieldsLogged) {
+            logPlayerFields(primaryPlayer);
+            playerFieldsLogged = true;
+        }
+
+        final Object rawPlayer = findPlayerObject(primaryPlayer);
 
         if (rawPlayer == null) {
-            log("Raw player: mPlayer == null");
+            log("Raw player: underlying player not found");
             return -1;
         }
+
+        log("Raw player object=" + rawPlayer.getClass().getName());
 
         final Object position = XposedHelpers.callMethod(rawPlayer, "getCurrentPosition");
         return ((Number) position).longValue();
     }
 
-    private Object findFieldValue(final Object object, final String fieldName) throws Throwable {
-        Class<?> clazz = object.getClass();
+    private Object findPlayerObject(final Object primaryPlayer) throws Throwable {
+        Class<?> clazz = primaryPlayer.getClass();
 
         while (clazz != null) {
-            try {
-                final Field field = clazz.getDeclaredField(fieldName);
+            for (Field field : clazz.getDeclaredFields()) {
                 field.setAccessible(true);
-                return field.get(object);
-            } catch (NoSuchFieldException ignored) {
-                clazz = clazz.getSuperclass();
+
+                final String name = field.getName();
+                final String type = field.getType().getName();
+
+                if ("mPlayer".equals(name)) {
+                    final Object value = field.get(primaryPlayer);
+
+                    if (value != null) {
+                        log("Found player field: " + clazz.getName() + "." + name + " -> " + value.getClass().getName());
+                        return value;
+                    }
+                }
+
+                if (name.toLowerCase().contains("player") || type.toLowerCase().contains("player")) {
+                    try {
+                        final Object value = field.get(primaryPlayer);
+
+                        if (value != null && hasGetCurrentPosition(value)) {
+                            log("Found candidate player field: " + clazz.getName() + "." + name + " -> " + value.getClass().getName());
+                            return value;
+                        }
+                    } catch (Throwable ignored) {
+                    }
+                }
             }
+
+            clazz = clazz.getSuperclass();
         }
 
-        throw new NoSuchFieldException(fieldName);
+        return null;
+    }
+
+    private boolean hasGetCurrentPosition(final Object object) {
+        try {
+            object.getClass().getMethod("getCurrentPosition");
+            return true;
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
+    private void logPlayerFields(final Object primaryPlayer) {
+        try {
+            Class<?> clazz = primaryPlayer.getClass();
+
+            log("PrimaryPlayer class=" + clazz.getName());
+
+            while (clazz != null) {
+                log("PrimaryPlayer fields in " + clazz.getName() + ":");
+
+                for (Field field : clazz.getDeclaredFields()) {
+                    log(
+                        "  field=" + field.getName() +
+                        ", type=" + field.getType().getName()
+                    );
+                }
+
+                clazz = clazz.getSuperclass();
+            }
+
+        } catch (Throwable t) {
+            logError("Failed to inspect PrimaryPlayer fields", t);
+        }
     }
 
     private long getAdEndPosition(final Object adClip) {
