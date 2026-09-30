@@ -2,7 +2,6 @@ package nagi.adskip.primevideo;
 
 import android.util.Log;
 
-import java.lang.reflect.Field;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -15,23 +14,21 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
 
 public class Main implements IXposedHookLoadPackage {
 
-    private static final String PRIME_VIDEO_PACKAGE = "com.amazon.avod.thirdpartyclient";
+    private static final String TAG = "PrimeAdSkip";
+    private static final String PRIME_PACKAGE = "com.amazon.avod.thirdpartyclient";
 
-    private static final long SKIP_DELAY_MS = 100;
-    private static final long VERIFY_INTERVAL_MS = 100;
-    private static final long VERIFY_TIMEOUT_MS = 1000;
-    private static final long POSITION_TOLERANCE_MS = 1000;
+    private final ScheduledExecutorService mExecutor = Executors.newScheduledThreadPool(1);
 
-    private final ScheduledExecutorService executor = Executors.newSingleThreadScheduledExecutor();
-
-    private boolean playerFieldsLogged = false;
+    private volatile Object mStateMachineContext;
 
     @Override
     public void handleLoadPackage(final XC_LoadPackage.LoadPackageParam lpparam) throws Throwable {
-        if (!PRIME_VIDEO_PACKAGE.equals(lpparam.packageName)) return;
+        if (!PRIME_PACKAGE.equals(lpparam.packageName)) return;
 
-        log("PrimeVideoAdSkip: loaded");
+        XposedBridge.log(TAG + ": Prime Video loaded");
+
         hookAdClipState(lpparam.classLoader);
+        hookSeekEnd(lpparam.classLoader);
     }
 
     private void hookAdClipState(final ClassLoader classLoader) {
@@ -54,280 +51,454 @@ public class Main implements IXposedHookLoadPackage {
                     @Override
                     protected void afterHookedMethod(final MethodHookParam param) {
                         try {
-                            handleAdClipEnter(param.thisObject, param.args[0]);
+                            final Object state = param.thisObject;
+                            final Object trigger = param.args[0];
+
+                            final Object triggerType = XposedHelpers.callMethod(trigger, "getType");
+                            if (triggerType == null) return;
+
+                            if (!"NEXT_AD_CLIP_SERVER_INSERTED".equals(triggerType.toString())) return;
+
+                            final Object context = XposedHelpers.callMethod(state, "getContext");
+                            if (context == null) {
+                                logError("Ad clip context is null");
+                                return;
+                            }
+
+                            mStateMachineContext = context;
+
+                            final Object adClip = XposedHelpers.callMethod(context, "getCurrentAdClip");
+                            if (adClip == null) {
+                                logError("Ad clip detected but currentAdClip is null");
+                                return;
+                            }
+
+                            final String adId = String.valueOf(XposedHelpers.callMethod(adClip, "getAdId"));
+
+                            XposedBridge.log(TAG + ": Ad clip detected: " + adId);
+
+                            final Object primaryPlayer = XposedHelpers.callMethod(
+                                context,
+                                "getPrimaryPlayer"
+                            );
+
+                            if (primaryPlayer == null) {
+                                logError("Primary player is null");
+                                return;
+                            }
+
+                            final long adClipStartTime = getTimeSpanMilliseconds(
+                                XposedHelpers.callMethod(adClip, "getAdClipStartTime")
+                            );
+
+                            final long duration = getTimeSpanMilliseconds(
+                                XposedHelpers.callMethod(adClip, "getDuration")
+                            );
+
+                            final long targetPosition = adClipStartTime + duration;
+                            final long startTime = System.currentTimeMillis();
+
+                            scheduleSkip(
+                                context,
+                                adClip,
+                                primaryPlayer,
+                                adId,
+                                targetPosition,
+                                startTime
+                            );
+
                         } catch (Throwable t) {
-                            logError("AdClipState.enter hook failed", t);
+                            logError("AdClipState.enter hook failed: " + Log.getStackTraceString(t));
                         }
                     }
                 }
             );
 
-            log("PrimeVideoAdSkip: AdClipState.enter hooked");
+            XposedBridge.log(TAG + ": AdClipState.enter hooked");
 
         } catch (Throwable t) {
-            logError("Failed to hook AdClipState", t);
+            logError("AdClipState hook failed: " + Log.getStackTraceString(t));
         }
     }
 
-    private void handleAdClipEnter(final Object adClipState, final Object trigger) {
-        if (trigger == null) return;
+    private void scheduleSkip(final Object context, final Object targetAdClip, final Object primaryPlayer, final String adId, final long targetPosition, final long startTime) {
+        mExecutor.schedule(() -> {
+            try {
+                final Object currentAdClip = XposedHelpers.callMethod(context, "getCurrentAdClip");
 
-        final Object triggerType = XposedHelpers.callMethod(trigger, "getType");
-        if (triggerType == null) return;
-
-        if (!"NEXT_AD_CLIP_SERVER_INSERTED".equals(triggerType.toString())) return;
-
-        final Object context = XposedHelpers.callMethod(adClipState, "getContext");
-        if (context == null) return;
-
-        final Object currentAdClip = XposedHelpers.callMethod(context, "getCurrentAdClip");
-
-        if (currentAdClip == null) {
-            log("currentAdClip == null");
-            return;
-        }
-
-        log("Ad clip detected: " + getAdId(currentAdClip));
-
-        scheduleSkip(context, currentAdClip, System.currentTimeMillis());
-    }
-
-    private void scheduleSkip(final Object context, final Object targetAdClip, final long startTime) {
-        executor.schedule(new Runnable() {
-            @Override
-            public void run() {
-                try {
-                    final Object currentAdClip = XposedHelpers.callMethod(context, "getCurrentAdClip");
-
-                    if (currentAdClip == null) {
-                        log("Ad skip request: currentAdClip == null");
-                        startSeekVerification(context, targetAdClip, startTime);
-                        return;
-                    }
-
-                    if (currentAdClip != targetAdClip) {
-                        log("Ad skip completed: ad clip changed");
-                        return;
-                    }
-
-                    final Object stateMachine = XposedHelpers.callMethod(context, "getStateMachine");
-
-                    if (stateMachine == null) {
-                        log("stateMachine == null");
-                        return;
-                    }
-
-                    log("Ad skip continuing: currentAdClip != null");
-                    log("skipCurrentAdClip(): " + getAdId(targetAdClip));
-
-                    XposedHelpers.callMethod(stateMachine, "skipCurrentAdClip");
-
-                    startSeekVerification(context, targetAdClip, startTime);
-
-                } catch (Throwable t) {
-                    logError("Ad skip attempt failed", t);
+                if (currentAdClip == null) {
+                    XposedBridge.log(TAG + ": Ad skip canceled: currentAdClip == null");
+                    return;
                 }
-            }
-        }, SKIP_DELAY_MS, TimeUnit.MILLISECONDS);
-    }
 
-    private void startSeekVerification(final Object context, final Object targetAdClip, final long startTime) {
-        try {
-            final long targetPosition = getAdEndPosition(targetAdClip);
+                final long elapsed = System.currentTimeMillis() - startTime;
 
-            log("Seek verification started: target=" + targetPosition + ", adId=" + getAdId(targetAdClip));
+                XposedBridge.log(
+                    TAG + ": Ad skip continuing: currentAdClip != null, elapsed=" +
+                    elapsed + "ms"
+                );
 
-            verifySeek(context, targetAdClip, targetPosition, startTime);
+                XposedBridge.log(TAG + ": skipCurrentAdClip(): " + adId);
 
-        } catch (Throwable t) {
-            logError("Failed to start seek verification", t);
-        }
-    }
+                final Object stateMachine = XposedHelpers.callMethod(
+                    context,
+                    "getStateMachine"
+                );
 
-    private void verifySeek(final Object context, final Object targetAdClip, final long targetPosition, final long startTime) {
-        executor.schedule(new Runnable() {
-            @Override
-            public void run() {
-                try {
-                    final long elapsed = System.currentTimeMillis() - startTime;
+                if (stateMachine == null) {
+                    logError("State machine is null");
+                    return;
+                }
 
-                    final Object primaryPlayer = XposedHelpers.callMethod(context, "getPrimaryPlayer");
+                XposedBridge.log(TAG + ": STATE MACHINE: skipCurrentAdClip() entered");
 
-                    if (primaryPlayer == null) {
-                        log("Seek verification: primaryPlayer == null");
-                        return;
-                    }
+                final Object stateMachineClip = XposedHelpers.callMethod(
+                    context,
+                    "getCurrentAdClip"
+                );
 
-                    final long logicalPosition = getLogicalPosition(primaryPlayer);
+                XposedBridge.log(
+                    TAG + ": STATE MACHINE: currentAdClip=" +
+                    String.valueOf(stateMachineClip)
+                );
 
-                    long rawPosition = -1;
-
-                    try {
-                        rawPosition = getRawPlayerPosition(primaryPlayer);
-                    } catch (Throwable t) {
-                        logError("Raw player position failed", t);
-                    }
-
-                    final Object currentAdClip = XposedHelpers.callMethod(context, "getCurrentAdClip");
-
-                    log(
-                        "Seek verification: elapsed=" + elapsed +
-                        "ms, logical=" + logicalPosition +
-                        ", raw=" + rawPosition +
-                        ", target=" + targetPosition +
-                        ", currentAdClip=" + getAdId(currentAdClip)
+                if (stateMachineClip != null) {
+                    XposedBridge.log(
+                        TAG + ": STATE MACHINE: adClipStartTime=" +
+                        String.valueOf(
+                            XposedHelpers.callMethod(
+                                stateMachineClip,
+                                "getAdClipStartTime"
+                            )
+                        )
                     );
 
-                    if (logicalPosition >= targetPosition - POSITION_TOLERANCE_MS) {
-                        log(
-                            "Ad skip verified: " + getAdId(targetAdClip) +
-                            ", logical=" + logicalPosition +
-                            ", raw=" + rawPosition
-                        );
-                        return;
-                    }
-
-                    if (elapsed >= VERIFY_TIMEOUT_MS) {
-                        log(
-                            "Ad skip FAILED: " + getAdId(targetAdClip) +
-                            ", logical=" + logicalPosition +
-                            ", raw=" + rawPosition +
-                            ", target=" + targetPosition +
-                            ", currentAdClip=" + getAdId(currentAdClip)
-                        );
-                        return;
-                    }
-
-                    verifySeek(context, targetAdClip, targetPosition, startTime);
-
-                } catch (Throwable t) {
-                    logError("Seek verification failed", t);
+                    XposedBridge.log(
+                        TAG + ": STATE MACHINE: duration=" +
+                        String.valueOf(
+                            XposedHelpers.callMethod(
+                                stateMachineClip,
+                                "getDuration"
+                            )
+                        )
+                    );
                 }
+
+                XposedHelpers.callMethod(stateMachine, "skipCurrentAdClip");
+
+                XposedBridge.log(TAG + ": STATE MACHINE: skipCurrentAdClip() returned");
+
+                XposedBridge.log(
+                    TAG + ": Seek verification started: target=" +
+                    targetPosition + ", adId=" + adId
+                );
+
+                mExecutor.schedule(
+                    () -> verifySeek(
+                        context,
+                        primaryPlayer,
+                        adId,
+                        targetPosition,
+                        startTime
+                    ),
+                    100L,
+                    TimeUnit.MILLISECONDS
+                );
+
+            } catch (Throwable t) {
+                logError("Ad skip failed: " + Log.getStackTraceString(t));
             }
-        }, VERIFY_INTERVAL_MS, TimeUnit.MILLISECONDS);
+        }, 100L, TimeUnit.MILLISECONDS);
+    }
+
+    private void verifySeek(final Object context, final Object primaryPlayer, final String adId, final long targetPosition, final long startTime) {
+        try {
+            final long elapsed = System.currentTimeMillis() - startTime;
+
+            final long logicalPosition = getLogicalPosition(primaryPlayer);
+            final String cachedPosition = getCachedPosition(primaryPlayer);
+            final String isSeeking = getIsSeeking(primaryPlayer);
+            final String enginePosition = getEnginePosition(primaryPlayer);
+            final String engineState = getEngineState(primaryPlayer);
+
+            final Object currentAdClip = XposedHelpers.callMethod(
+                context,
+                "getCurrentAdClip"
+            );
+
+            XposedBridge.log(
+                TAG + ": Seek verification: elapsed=" +
+                elapsed +
+                "ms, logical=" +
+                logicalPosition +
+                ", cached=" +
+                cachedPosition +
+                ", seeking=" +
+                isSeeking +
+                ", engine=" +
+                enginePosition +
+                ", engineState=" +
+                engineState +
+                ", currentAdClip=" +
+                String.valueOf(currentAdClip)
+            );
+
+            if (isTargetReached(enginePosition, targetPosition)) {
+                XposedBridge.log(
+                    TAG + ": Ad skip verified: " +
+                    adId +
+                    ", logical=" +
+                    logicalPosition +
+                    ", engine=" +
+                    enginePosition +
+                    ", target=" +
+                    targetPosition
+                );
+                return;
+            }
+
+            if (elapsed >= 2000L) {
+                XposedBridge.log(
+                    TAG + ": Ad skip verification timeout: " +
+                    adId +
+                    ", logical=" +
+                    logicalPosition +
+                    ", cached=" +
+                    cachedPosition +
+                    ", seeking=" +
+                    isSeeking +
+                    ", engine=" +
+                    enginePosition +
+                    ", engineState=" +
+                    engineState +
+                    ", currentAdClip=" +
+                    String.valueOf(currentAdClip)
+                );
+                return;
+            }
+
+            mExecutor.schedule(
+                () -> verifySeek(
+                    context,
+                    primaryPlayer,
+                    adId,
+                    targetPosition,
+                    startTime
+                ),
+                100L,
+                TimeUnit.MILLISECONDS
+            );
+
+        } catch (Throwable t) {
+            logError("Seek verification failed: " + Log.getStackTraceString(t));
+        }
+    }
+
+    private void hookSeekEnd(final ClassLoader classLoader) {
+        try {
+            final Class<?> playerClass = XposedHelpers.findClass(
+                "com.amazon.avod.playback.session.AmazonVideoPlayer",
+                classLoader
+            );
+
+            XposedHelpers.findAndHookMethod(
+                playerClass,
+                "onSeekEnd",
+                new XC_MethodHook() {
+                    @Override
+                    protected void afterHookedMethod(final MethodHookParam param) {
+                        try {
+                            final Object player = param.thisObject;
+
+                            XposedBridge.log(
+                                TAG +
+                                ": onSeekEnd: logical=" +
+                                getLogicalPosition(player) +
+                                ", cached=" +
+                                getCachedPosition(player) +
+                                ", engine=" +
+                                getEnginePosition(player) +
+                                ", seeking=" +
+                                getIsSeeking(player) +
+                                ", engineState=" +
+                                getEngineState(player)
+                            );
+
+                        } catch (Throwable t) {
+                            logError(
+                                "onSeekEnd logging failed: " +
+                                Log.getStackTraceString(t)
+                            );
+                        }
+                    }
+                }
+            );
+
+            XposedBridge.log(TAG + ": AmazonVideoPlayer.onSeekEnd hooked");
+
+        } catch (Throwable t) {
+            logError("onSeekEnd hook failed: " + Log.getStackTraceString(t));
+        }
     }
 
     private long getLogicalPosition(final Object primaryPlayer) {
-        final Object position = XposedHelpers.callMethod(primaryPlayer, "getCurrentPosition");
-        return ((Number) position).longValue();
-    }
+        try {
+            final Object value = XposedHelpers.callMethod(
+                primaryPlayer,
+                "getCurrentPosition"
+            );
 
-    private long getRawPlayerPosition(final Object primaryPlayer) throws Throwable {
-        if (!playerFieldsLogged) {
-            logPlayerFields(primaryPlayer);
-            playerFieldsLogged = true;
-        }
-
-        final Object rawPlayer = findPlayerObject(primaryPlayer);
-
-        if (rawPlayer == null) {
-            log("Raw player: underlying player not found");
-            return -1;
-        }
-
-        log("Raw player object=" + rawPlayer.getClass().getName());
-
-        final Object position = XposedHelpers.callMethod(rawPlayer, "getCurrentPosition");
-        return ((Number) position).longValue();
-    }
-
-    private Object findPlayerObject(final Object primaryPlayer) throws Throwable {
-        Class<?> clazz = primaryPlayer.getClass();
-
-        while (clazz != null) {
-            for (Field field : clazz.getDeclaredFields()) {
-                field.setAccessible(true);
-
-                final String name = field.getName();
-                final String type = field.getType().getName();
-
-                if ("mPlayer".equals(name)) {
-                    final Object value = field.get(primaryPlayer);
-
-                    if (value != null) {
-                        log("Found player field: " + clazz.getName() + "." + name + " -> " + value.getClass().getName());
-                        return value;
-                    }
-                }
-
-                if (name.toLowerCase().contains("player") || type.toLowerCase().contains("player")) {
-                    try {
-                        final Object value = field.get(primaryPlayer);
-
-                        if (value != null && hasGetCurrentPosition(value)) {
-                            log("Found candidate player field: " + clazz.getName() + "." + name + " -> " + value.getClass().getName());
-                            return value;
-                        }
-                    } catch (Throwable ignored) {
-                    }
-                }
+            if (value instanceof Number) {
+                return ((Number) value).longValue();
             }
 
-            clazz = clazz.getSuperclass();
-        }
+            return -1L;
 
-        return null;
+        } catch (Throwable t) {
+            return -1L;
+        }
     }
 
-    private boolean hasGetCurrentPosition(final Object object) {
+    private String getCachedPosition(final Object primaryPlayer) {
         try {
-            object.getClass().getMethod("getCurrentPosition");
-            return true;
-        } catch (Throwable ignored) {
+            final Object ref = XposedHelpers.getObjectField(
+                primaryPlayer,
+                "mCachedPosition"
+            );
+
+            if (ref == null) return "null";
+
+            final Object value = XposedHelpers.callMethod(ref, "get");
+
+            if (value == null) return "null";
+
+            final Object millis = XposedHelpers.callMethod(
+                value,
+                "getTotalMilliseconds"
+            );
+
+            if (millis instanceof Number) {
+                return String.valueOf(((Number) millis).longValue());
+            }
+
+            return String.valueOf(millis);
+
+        } catch (Throwable t) {
+            return "ERROR:" + t.getClass().getSimpleName();
+        }
+    }
+
+    private String getIsSeeking(final Object primaryPlayer) {
+        try {
+            return String.valueOf(
+                XposedHelpers.getBooleanField(
+                    primaryPlayer,
+                    "mIsSeeking"
+                )
+            );
+
+        } catch (Throwable t) {
+            return "ERROR:" + t.getClass().getSimpleName();
+        }
+    }
+
+    private String getEnginePosition(final Object primaryPlayer) {
+        try {
+            final Object playbackSession = XposedHelpers.getObjectField(
+                primaryPlayer,
+                "mPlaybackSession"
+            );
+
+            if (playbackSession == null) return "null";
+
+            final Object playbackEngine = XposedHelpers.callMethod(
+                playbackSession,
+                "getPlaybackEngine"
+            );
+
+            if (playbackEngine == null) return "null";
+
+            final Object positionNanos = XposedHelpers.callMethod(
+                playbackEngine,
+                "getCurrentPositionInNanos"
+            );
+
+            if (!(positionNanos instanceof Number)) {
+                return "unknown";
+            }
+
+            return String.valueOf(
+                ((Number) positionNanos).longValue() / 1000000L
+            );
+
+        } catch (Throwable t) {
+            return "ERROR:" + t.getClass().getSimpleName();
+        }
+    }
+
+    private String getEngineState(final Object primaryPlayer) {
+        try {
+            final Object playbackSession = XposedHelpers.getObjectField(
+                primaryPlayer,
+                "mPlaybackSession"
+            );
+
+            if (playbackSession == null) return "null";
+
+            final Object playbackEngine = XposedHelpers.callMethod(
+                playbackSession,
+                "getPlaybackEngine"
+            );
+
+            if (playbackEngine == null) return "null";
+
+            final Object state = XposedHelpers.callMethod(
+                playbackEngine,
+                "getPlaybackState"
+            );
+
+            return String.valueOf(state);
+
+        } catch (Throwable t) {
+            return "ERROR:" + t.getClass().getSimpleName();
+        }
+    }
+
+    private boolean isTargetReached(final String enginePosition, final long targetPosition) {
+        try {
+            if ("null".equals(enginePosition)) return false;
+            if ("unknown".equals(enginePosition)) return false;
+            if (enginePosition.startsWith("ERROR:")) return false;
+
+            final long position = Long.parseLong(enginePosition);
+
+            return position >= targetPosition - 1000L;
+
+        } catch (Throwable t) {
             return false;
         }
     }
 
-    private void logPlayerFields(final Object primaryPlayer) {
+    private long getTimeSpanMilliseconds(final Object timeSpan) {
+        if (timeSpan == null) return 0L;
+
         try {
-            Class<?> clazz = primaryPlayer.getClass();
+            final Object value = XposedHelpers.callMethod(
+                timeSpan,
+                "getTotalMilliseconds"
+            );
 
-            log("PrimaryPlayer class=" + clazz.getName());
-
-            while (clazz != null) {
-                log("PrimaryPlayer fields in " + clazz.getName() + ":");
-
-                for (Field field : clazz.getDeclaredFields()) {
-                    log(
-                        "  field=" + field.getName() +
-                        ", type=" + field.getType().getName()
-                    );
-                }
-
-                clazz = clazz.getSuperclass();
+            if (value instanceof Number) {
+                return ((Number) value).longValue();
             }
 
-        } catch (Throwable t) {
-            logError("Failed to inspect PrimaryPlayer fields", t);
-        }
-    }
-
-    private long getAdEndPosition(final Object adClip) {
-        final Object startTime = XposedHelpers.callMethod(adClip, "getAdClipStartTime");
-        final Object duration = XposedHelpers.callMethod(adClip, "getDuration");
-
-        final long startMillis = ((Number) XposedHelpers.callMethod(startTime, "getTotalMilliseconds")).longValue();
-        final long durationMillis = ((Number) XposedHelpers.callMethod(duration, "getTotalMilliseconds")).longValue();
-
-        return startMillis + durationMillis;
-    }
-
-    private String getAdId(final Object adClip) {
-        if (adClip == null) return "null";
-
-        try {
-            final Object adId = XposedHelpers.callMethod(adClip, "getAdId");
-            return String.valueOf(adId);
         } catch (Throwable ignored) {
-            return "unknown";
         }
+
+        return 0L;
     }
 
-    private void log(final String message) {
-        XposedBridge.log("PrimeVideoAdSkip: " + message);
-    }
-
-    private void logError(final String message, final Throwable t) {
-        XposedBridge.log("PrimeVideoAdSkip: " + message + " " + Log.getStackTraceString(t));
+    private void logError(final String message) {
+        XposedBridge.log(TAG + ": ERROR: " + message);
     }
 }
