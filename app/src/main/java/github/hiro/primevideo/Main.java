@@ -2,6 +2,7 @@ package nagi.adskip.primevideo;
 
 import android.util.Log;
 
+import java.lang.reflect.Field;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -84,9 +85,7 @@ public class Main implements IXposedHookLoadPackage {
             return;
         }
 
-        final String adId = getAdId(currentAdClip);
-
-        log("Ad clip detected: " + adId);
+        log("Ad clip detected: " + getAdId(currentAdClip));
 
         scheduleSkip(context, currentAdClip, System.currentTimeMillis());
     }
@@ -131,18 +130,16 @@ public class Main implements IXposedHookLoadPackage {
     }
 
     private void startSeekVerification(final Object context, final Object targetAdClip, final long startTime) {
-        final long targetPosition;
-
         try {
-            targetPosition = getAdEndPosition(targetAdClip);
+            final long targetPosition = getAdEndPosition(targetAdClip);
+
+            log("Seek verification started: target=" + targetPosition + ", adId=" + getAdId(targetAdClip));
+
+            verifySeek(context, targetAdClip, targetPosition, startTime);
+
         } catch (Throwable t) {
-            logError("Failed to get ad end position", t);
-            return;
+            logError("Failed to start seek verification", t);
         }
-
-        log("Seek verification started: target=" + targetPosition + ", adId=" + getAdId(targetAdClip));
-
-        verifySeek(context, targetAdClip, targetPosition, startTime);
     }
 
     private void verifySeek(final Object context, final Object targetAdClip, final long targetPosition, final long startTime) {
@@ -159,28 +156,75 @@ public class Main implements IXposedHookLoadPackage {
                         return;
                     }
 
-                    final long currentPosition = getCurrentPosition(primaryPlayer);
+                    final long logicalPosition = getLogicalPosition(primaryPlayer);
+                    final long rawPosition = getRawPlayerPosition(primaryPlayer);
+
                     final Object currentAdClip = XposedHelpers.callMethod(context, "getCurrentAdClip");
 
-                    log("Seek verification: elapsed=" + elapsed + "ms, current=" + currentPosition + ", target=" + targetPosition + ", currentAdClip=" + getAdId(currentAdClip));
+                    log(
+                        "Seek verification: elapsed=" + elapsed +
+                        "ms, logical=" + logicalPosition +
+                        ", raw=" + rawPosition +
+                        ", target=" + targetPosition +
+                        ", currentAdClip=" + getAdId(currentAdClip)
+                    );
 
-                    if (currentPosition >= targetPosition - POSITION_TOLERANCE_MS) {
-                        log("Ad skip verified: " + getAdId(targetAdClip) + ", position=" + currentPosition);
-                        return;
+                    if (logicalPosition >= targetPosition - POSITION_TOLERANCE_MS) {
+                        log(
+                            "Ad skip verified: " + getAdId(targetAdClip) +
+                            ", logical=" + logicalPosition +
+                            ", raw=" + rawPosition
+                        );
+                    } else if (elapsed >= VERIFY_TIMEOUT_MS) {
+                        log(
+                            "Ad skip FAILED: " + getAdId(targetAdClip) +
+                            ", logical=" + logicalPosition +
+                            ", raw=" + rawPosition +
+                            ", target=" + targetPosition +
+                            ", currentAdClip=" + getAdId(currentAdClip)
+                        );
+                    } else {
+                        verifySeek(context, targetAdClip, targetPosition, startTime);
                     }
-
-                    if (elapsed >= VERIFY_TIMEOUT_MS) {
-                        log("Ad skip FAILED: " + getAdId(targetAdClip) + ", position=" + currentPosition + ", target=" + targetPosition + ", currentAdClip=" + getAdId(currentAdClip));
-                        return;
-                    }
-
-                    verifySeek(context, targetAdClip, targetPosition, startTime);
 
                 } catch (Throwable t) {
                     logError("Seek verification failed", t);
                 }
             }
         }, VERIFY_INTERVAL_MS, TimeUnit.MILLISECONDS);
+    }
+
+    private long getLogicalPosition(final Object primaryPlayer) {
+        final Object position = XposedHelpers.callMethod(primaryPlayer, "getCurrentPosition");
+        return ((Number) position).longValue();
+    }
+
+    private long getRawPlayerPosition(final Object primaryPlayer) throws Throwable {
+        final Object rawPlayer = findFieldValue(primaryPlayer, "mPlayer");
+
+        if (rawPlayer == null) {
+            log("Raw player: mPlayer == null");
+            return -1;
+        }
+
+        final Object position = XposedHelpers.callMethod(rawPlayer, "getCurrentPosition");
+        return ((Number) position).longValue();
+    }
+
+    private Object findFieldValue(final Object object, final String fieldName) throws Throwable {
+        Class<?> clazz = object.getClass();
+
+        while (clazz != null) {
+            try {
+                final Field field = clazz.getDeclaredField(fieldName);
+                field.setAccessible(true);
+                return field.get(object);
+            } catch (NoSuchFieldException ignored) {
+                clazz = clazz.getSuperclass();
+            }
+        }
+
+        throw new NoSuchFieldException(fieldName);
     }
 
     private long getAdEndPosition(final Object adClip) {
@@ -191,11 +235,6 @@ public class Main implements IXposedHookLoadPackage {
         final long durationMillis = ((Number) XposedHelpers.callMethod(duration, "getTotalMilliseconds")).longValue();
 
         return startMillis + durationMillis;
-    }
-
-    private long getCurrentPosition(final Object primaryPlayer) {
-        final Object position = XposedHelpers.callMethod(primaryPlayer, "getCurrentPosition");
-        return ((Number) position).longValue();
     }
 
     private String getAdId(final Object adClip) {
