@@ -27,8 +27,9 @@ public class Main implements IXposedHookLoadPackage {
         Executors.newScheduledThreadPool(1);
 
     /*
-     * ServerInsertedAdBreakState.enter() → 内部doTrigger()
-     * の同一スレッド間で、シーク時の本来のseekTargetを渡す。
+     * シークで広告Breakへ入った場合だけ、
+     * ServerInsertedAdBreakState.enter() の
+     * getSeekTarget() を一時保存する。
      */
     private final ThreadLocal<Long> mPendingSeekTarget =
         new ThreadLocal<>();
@@ -68,115 +69,42 @@ public class Main implements IXposedHookLoadPackage {
                         final MethodHookParam param
                     ) {
                         try {
-                            prepareAdBreakTarget(
-                                param,
-                                classLoader
-                            );
+                            final Object trigger = param.args[0];
+
+                            if (trigger == null) {
+                                return;
+                            }
+
+                            /*
+                             * ここで取れるのは主に
+                             * シーク経由のAdBreakTrigger。
+                             *
+                             * 通常再生ではseekTarget == nullなので
+                             * 何もしない。
+                             */
+                            final Object seekTarget =
+                                XposedHelpers.callMethod(
+                                    trigger,
+                                    "getSeekTarget"
+                                );
+
+                            if (seekTarget == null) {
+                                return;
+                            }
+
+                            final long target =
+                                getTimeSpanMilliseconds(
+                                    seekTarget
+                                );
+
+                            if (target >= 0L) {
+                                mPendingSeekTarget.set(target);
+                            }
+
                         } catch (Throwable ignored) {
                         }
                     }
                 }
-            );
-
-        } catch (Throwable ignored) {
-        }
-    }
-
-    private void prepareAdBreakTarget(
-        final XC_MethodHook.MethodHookParam param,
-        final ClassLoader classLoader
-    ) {
-        final Object trigger = param.args[0];
-
-        if (trigger == null) {
-            return;
-        }
-
-        /*
-         * ServerInsertedAdBreakState.enter() に渡されるのは
-         * AdBreakTrigger。
-         */
-        final Object seekTarget;
-
-        try {
-            seekTarget =
-                XposedHelpers.callMethod(
-                    trigger,
-                    "getSeekTarget"
-                );
-        } catch (Throwable e) {
-            return;
-        }
-
-        /*
-         * seekTarget != null
-         *
-         * = ユーザーがシークした結果、
-         *   途中に広告Breakが存在するケース。
-         *
-         * この場合はAmazonが持っている本来の
-         * 「広告を越えた後のシーク先」を使う。
-         */
-        if (seekTarget != null) {
-            final long target =
-                getTimeSpanMilliseconds(seekTarget);
-
-            if (target >= 0L) {
-                mPendingSeekTarget.set(target);
-            }
-
-            return;
-        }
-
-        /*
-         * 通常再生から広告Breakに入ったケース。
-         *
-         * ここではまだcurrentPositionを取得できるので、
-         * 広告終了位置を先に計算して保存する。
-         */
-        try {
-            final Object state = param.thisObject;
-
-            final Object context =
-                XposedHelpers.callMethod(
-                    state,
-                    "getContext"
-                );
-
-            if (context == null) {
-                return;
-            }
-
-            final Object adBreak =
-                XposedHelpers.callMethod(
-                    context,
-                    "getCurrentAdBreak"
-                );
-
-            final Object primaryPlayer =
-                XposedHelpers.callMethod(
-                    context,
-                    "getPrimaryPlayer"
-                );
-
-            if (adBreak == null ||
-                primaryPlayer == null) {
-                return;
-            }
-
-            final long currentPosition =
-                getCurrentPosition(primaryPlayer);
-
-            final long duration =
-                getAdDuration(adBreak);
-
-            if (currentPosition < 0L ||
-                duration <= 0L) {
-                return;
-            }
-
-            mPendingSeekTarget.set(
-                currentPosition + duration
             );
 
         } catch (Throwable ignored) {
@@ -267,48 +195,6 @@ public class Main implements IXposedHookLoadPackage {
             return;
         }
 
-        /*
-         * ここに来るのは
-         *
-         * ServerInsertedAdBreakState.enter()
-         *     ↓
-         * doTrigger(NEXT_AD_CLIP_SERVER_INSERTED)
-         *
-         * の内部doTrigger。
-         *
-         * enter()のbeforeHookで保存したtargetを使う。
-         */
-        final Long pendingTarget =
-            mPendingSeekTarget.get();
-
-        if (pendingTarget == null) {
-            return;
-        }
-
-        /*
-         * 一度使ったtargetは必ず消す。
-         */
-        mPendingSeekTarget.remove();
-
-        final Object replacementTrigger =
-            createNoMoreAdsSkipTrigger(
-                trigger,
-                classLoader
-            );
-
-        if (replacementTrigger == null) {
-            return;
-        }
-
-        /*
-         * AdClipStateへ進むはずだったtriggerを
-         * NO_MORE_ADS_SKIP_TRANSITIONへ変更する。
-         *
-         * doTrigger()自身はそのまま実行されるので、
-         * こちらからdoTrigger()を再帰呼び出ししない。
-         */
-        param.args[0] = replacementTrigger;
-
         final Object context;
 
         try {
@@ -341,9 +227,117 @@ public class Main implements IXposedHookLoadPackage {
             return;
         }
 
+        /*
+         * --------------------------------------------------
+         * 1. シークで広告を跨いだケース
+         * --------------------------------------------------
+         *
+         * ServerInsertedAdBreakState.enter() の
+         * beforeHookで保存したseekTargetを使用する。
+         */
+        Long target = mPendingSeekTarget.get();
+
+        if (target != null) {
+            mPendingSeekTarget.remove();
+
+            replaceTriggerAndScheduleSeek(
+                param,
+                trigger,
+                primaryPlayer,
+                target.longValue(),
+                classLoader
+            );
+
+            return;
+        }
+
+        /*
+         * --------------------------------------------------
+         * 2. 通常再生中に広告Breakへ入ったケース
+         * --------------------------------------------------
+         *
+         * この時点ではServerInsertedAdBreakState.enter()
+         * の内部処理によってcurrentAdBreakが既にセットされている。
+         */
+        final Object adBreak;
+
+        try {
+            adBreak =
+                XposedHelpers.callMethod(
+                    context,
+                    "getCurrentAdBreak"
+                );
+        } catch (Throwable e) {
+            return;
+        }
+
+        if (adBreak == null) {
+            return;
+        }
+
+        final long currentPosition =
+            getCurrentPosition(primaryPlayer);
+
+        if (currentPosition < 0L) {
+            return;
+        }
+
+        final long adDuration =
+            getAdDuration(adBreak);
+
+        if (adDuration <= 0L) {
+            return;
+        }
+
+        final long targetPosition =
+            currentPosition + adDuration;
+
+        replaceTriggerAndScheduleSeek(
+            param,
+            trigger,
+            primaryPlayer,
+            targetPosition,
+            classLoader
+        );
+    }
+
+    private void replaceTriggerAndScheduleSeek(
+        final XC_MethodHook.MethodHookParam param,
+        final Object originalTrigger,
+        final Object primaryPlayer,
+        final long targetPosition,
+        final ClassLoader classLoader
+    ) {
+        final Object replacementTrigger =
+            createNoMoreAdsSkipTrigger(
+                originalTrigger,
+                classLoader
+            );
+
+        if (replacementTrigger == null) {
+            return;
+        }
+
+        /*
+         * NEXT_AD_CLIP_SERVER_INSERTED
+         *
+         * ↓
+         *
+         * NO_MORE_ADS_SKIP_TRANSITION
+         *
+         * に置換。
+         *
+         * ここではdoTrigger()を呼び直さない。
+         */
+        param.args[0] = replacementTrigger;
+
+        /*
+         * FSM遷移後にPlayingになるのを待って
+         * 広告終了位置へAD_SKIP seekする。
+         */
         scheduleSeekAfterPlaying(
             primaryPlayer,
-            pendingTarget.longValue(),
+            targetPosition,
             classLoader
         );
     }
@@ -455,9 +449,6 @@ public class Main implements IXposedHookLoadPackage {
                 return;
             }
 
-            /*
-             * Launching + Seekを避ける。
-             */
             if (System.currentTimeMillis() - startTime >= 2000L) {
                 return;
             }
